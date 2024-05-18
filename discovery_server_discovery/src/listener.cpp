@@ -1,5 +1,7 @@
 #include <discovery_server_discovery/listener.hpp>
 
+#include <fastdds/dds/domain/DomainParticipantFactory.hpp>
+
 #include <rclcpp/subscription_options.hpp>
 
 #include <cstdlib>
@@ -8,31 +10,19 @@
 #include <iomanip>
 #include <ostream>
 
+using eprosima::fastdds::dds::DomainParticipant;
+using eprosima::fastdds::dds::DomainParticipantFactory;
 using eprosima::fastdds::dds::DomainParticipantQos;
-using std::placeholders::_1;
+using eprosima::fastdds::rtps::get_server_client_default_guidPrefix;
+using eprosima::fastrtps::rtps::DiscoveryProtocol_t;
+using eprosima::fastrtps::rtps::IPLocator;
+using eprosima::fastrtps::rtps::Locator_t;
+using eprosima::fastrtps::rtps::RemoteServerAttributes;
 
-std::string id_to_guid_prefix(uint8_t id) {
-  // We must convert `id` to uint16_t because C++ has special rules for
-  // formatting `char` types, and uint8_t is an alias of `char`.
-  std::ostringstream ss;
-  ss << "44.53." << std::setw(2) << std::setfill('0') << std::hex
-     << static_cast<uint16_t>(id) << ".5f.45.50.52.4f.53.49.4d.41";
-  return ss.str();
-}
+using std::placeholders::_1;
 
 DiscoveryServerListener::DiscoveryServerListener()
     : rclcpp::Node("discovery_server_manager") {
-
-  auto env_file = std::getenv("FASTDDS_ENVIRONMENT_FILE");
-  if (env_file == nullptr) {
-    RCLCPP_FATAL(get_logger(),
-                 "FASTDDS_ENVIRONMENT_FILE environment variable not set");
-    exit(1);
-  }
-  fastdds_environment_file_ = env_file;
-  RCLCPP_INFO_STREAM(get_logger(), "using FastDDS environment file: "
-                                       << fastdds_environment_file_.native());
-
   // TODO: Add descriptor limiting range to [0, 255]
   declare_parameter("discovery_server_id", rclcpp::PARAMETER_INTEGER);
   declare_parameter("discovery_server_address", rclcpp::PARAMETER_STRING);
@@ -65,7 +55,7 @@ DiscoveryServerListener::DiscoveryServerListener()
       get_parameter("discovery_server_address").as_string();
   this_server_info->port = get_parameter("discovery_server_port").as_int();
 
-  update_server_info(this_server_info);
+  configure_auxiliary_server(this_server_info);
 
   // Publish our info immediately, transient local durability policy
   // will re-send if new subscribers connect later.
@@ -82,33 +72,56 @@ void DiscoveryServerListener::discovery_info_callback(
 
 void DiscoveryServerListener::update_server_info(
     const ServerInfo::ConstSharedPtr &info) {
-  // Ensure there is enough space for the new server
-  server_info_.resize(info->id + 1);
-  if (server_info_[info->id] != nullptr) {
-    RCLCPP_WARN_STREAM(
-        "Overwriting discovery info for server:\n"
-        << discovery_interfaces::msg::to_yaml(server_info_[info->id])
-        << "with new info:\n"
-        << discovery_interfaces::msg::to_yaml(info));
-  }
-  server_info_[info->id] = info;
-  write_environment_file();
-}
+  auto &entry = server_info_[info->id];
 
-void DiscoveryServerListener::write_environment_file() const {
-  std::ofstream env_file(fastdds_environment_file_.native(), std::ios::out);
-  env_file << "{\n"
-           << "\t\"ROS_DISCOVERY_SERVER\": \"" << format_server_info() << "\"\n"
-           << "}\n";
-}
-
-std::string DiscoveryServerListener::format_server_info() const {
-  std::ostringstream ss;
-  for (const auto &info : server_info_) {
-    if (info) {
-      ss << info->address << ":" << info->port;
+  if (entry != nullptr) {
+    if (*entry != *info) {
+      RCLCPP_WARN_STREAM(get_logger(),
+                         "Received duplicate ID for server:\n"
+                             << discovery_interfaces::msg::to_yaml(*entry)
+                             << "with different configuration:\n"
+                             << discovery_interfaces::msg::to_yaml(*info));
+    } else {
+      RCLCPP_INFO(get_logger(), "Ignoring duplicate discovery server info");
     }
-    ss << ";";
+    return;
   }
-  return ss.str();
+  entry = info;
+
+  // TODO Validate IP/port/id
+  Locator_t remote_server_locator;
+  // TODO: Check address format and use appropriate locator
+  IPLocator::setIPv4(remote_server_locator, info->address);
+  remote_server_locator.port = info->port;
+
+  RemoteServerAttributes remote_server_attr;
+  get_server_client_default_guidPrefix(info->id, remote_server_attr.guidPrefix);
+  remote_server_attr.metatrafficUnicastLocatorList.push_back(
+      remote_server_locator);
+  server_qos_.wire_protocol()
+      .builtin.discovery_config.m_DiscoveryServers.push_back(
+          remote_server_attr);
+  aux_server_->set_qos(server_qos_);
+}
+
+void DiscoveryServerListener::configure_auxiliary_server(
+    const ServerInfo::ConstSharedPtr &info) {
+  RCLCPP_INFO_STREAM(get_logger(),
+                     "Configuring discovery server:\n"
+                         << discovery_interfaces::msg::to_yaml(*info));
+  Locator_t server_locator;
+  IPLocator::setIPv4(server_locator, info->address);
+  server_locator.port = info->port;
+
+  server_qos_.name(info->name);
+  server_qos_.wire_protocol().builtin.discovery_config.discoveryProtocol =
+      DiscoveryProtocol_t::SERVER;
+  get_server_client_default_guidPrefix(info->id,
+                                       server_qos_.wire_protocol().prefix);
+  server_qos_.wire_protocol().builtin.metatrafficUnicastLocatorList.push_back(
+      server_locator);
+
+  aux_server_ = std::unique_ptr<DomainParticipant>(
+      DomainParticipantFactory::get_instance()->create_participant(
+          0, server_qos_));
 }
